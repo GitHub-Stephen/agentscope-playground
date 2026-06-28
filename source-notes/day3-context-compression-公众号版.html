@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>body {
+    font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    font-size: 16px; color: #333; line-height: 1.8;
+    max-width: 640px; margin: 0 auto; padding: 20px;
+}
+h1 { font-size: 22px; font-weight: bold; text-align: center; margin: 24px 0 16px; }
+h2 {
+    font-size: 19px; font-weight: bold; margin: 28px 0 12px;
+    padding-left: 10px; border-left: 3px solid #4A90D9;
+}
+blockquote {
+    background: #f5f7fa; border-left: 4px solid #4A90D9;
+    padding: 10px 16px; margin: 12px 0; font-size: 15px; color: #666;
+}
+code {
+    background: #f0f0f0; padding: 2px 6px; border-radius: 3px;
+    font-size: 14px; font-family: 'Menlo', 'Consolas', monospace;
+}
+pre {
+    background: #282c34; color: #abb2bf; padding: 16px;
+    border-radius: 6px; overflow-x: auto; font-size: 13px; line-height: 1.6;
+}
+pre code { background: none; color: inherit; padding: 0; }
+table {
+    border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px;
+}
+td, th { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+th { background: #f5f7fa; font-weight: bold; }
+strong { color: #2c3e50; }
+p { margin: 10px 0; }
+hr { border: none; border-top: 1px solid #eee; margin: 24px 0; }</style>
+</head>
+<body>
+<h1>AgentScope 源码课：Context 满了怎么办？—— 不删，压缩</h1>
+<blockquote>
+<p>系列：Coach 别跑！AgentScope 源码拆解<br />
+本篇：第 3 课 · Context 撑爆了？它选择压缩<br />
+前情：第 2 课我们翻遍了 Memory 抽屉，发现每次 reply() 都往里塞两条消息</p>
+</blockquote>
+<hr />
+<h2>① 「教练，抽屉快撑爆了」</h2>
+<p>徒弟盯着屏幕，突然回过神：</p>
+<blockquote>
+<p>等等，上节课你说 context 是个 Python list，每聊一轮往里塞两条。<br />
+那聊 100 轮不就 200 条了？聊 1000 轮呢？<br />
+<strong>大模型的上下文窗口又不是无限的！</strong></p>
+</blockquote>
+<p>教练放下茶杯：问得好。你猜 AgentScope 会怎么做？</p>
+<p>徒弟想了想：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>方案 A</td>
+<td>满了就报错，「对不起你的对话太长了」</td>
+</tr>
+<tr>
+<td>方案 B</td>
+<td>暴力删最早的对话</td>
+</tr>
+<tr>
+<td>方案 C</td>
+<td>把旧对话浓缩成一段摘要，用摘要替换掉旧内容</td>
+</tr>
+</tbody>
+</table>
+<p>教练：<strong>选 C。而且它做得比你想象的更聪明。</strong></p>
+<hr />
+<h2>② 「它不是删，是『压缩』」</h2>
+<p>徒弟：压缩？用 zip 那种压缩吗？</p>
+<p>教练：不是文件压缩，是<strong>让大模型自己写摘要</strong>。</p>
+<p>你看这段源码，在 <code>_agent.py</code> 第 256 行：</p>
+<pre><code class="language-python">async def compress_context(self, context_config=None):
+    # 1. 数一数当前 context 有多少 token
+    estimated_tokens = await self.model.count_tokens(...)
+
+    # 2. 超了 80% 的窗口？触发压缩
+    if estimated_tokens &lt; 阈值:
+        return  # 没满，跳过
+
+    # 3. 把旧对话喂给大模型
+    #    让大模型生成结构化摘要
+    res = await model.generate_structured_output(
+        messages = 系统提示 + 旧对话 + 压缩提示词,
+        schema   = 摘要模板,
+    )
+
+    # 4. 用摘要替换掉旧内容
+    self.state.summary = res.content
+    self.state.context = 最近的消息.保留()
+</code></pre>
+<p>教练敲了敲桌子：<strong>每次 Agent 要回复你之前，它会先看一眼——「我抽屉里的 token 有没有超过窗口的 80%？」</strong>，超了就压缩。</p>
+<p>徒弟恍然大悟：所以它是在 <code>_reply()</code> 的入口处检查的？</p>
+<p>教练：<strong>对，第 535 行。每次回复前先 compress，再推理。</strong></p>
+<hr />
+<h2>③ 「看看它是怎么切的」</h2>
+<p>徒弟：那它是把整个 context 都拿去压缩吗？最近说的话会不会也丢了？</p>
+<p>教练：这就是巧妙的地方——它<strong>只压缩旧的，留最近的</strong>。</p>
+<p>看分割逻辑（<code>_split_context_for_compression</code>，第 1630 行）：</p>
+<pre><code>context = [旧1, 旧2, 旧3, ..., 最近1, 最近2, 最近3]
+           ↑ 拿去压缩                         ↑ 保留不动
+</code></pre>
+<p>怎么切的？<strong>从尾巴往前数</strong>：</p>
+<pre><code>① 从 context 最后一条消息开始
+② 一条一条往前加
+③ 直到快占满「保留区」（默认 10% 的窗口大小）
+④ 前面的全部归入「待压缩区」
+</code></pre>
+<p>而且边界消息的处理很细腻——如果一条消息里既有工具调用又有结果，它会按 content block 粒度切分，<strong>不会把工具调用和结果拆散</strong>。</p>
+<p>徒弟：哦！这不就是「最近的事记得清，旧事记个大纲」嘛。</p>
+<p>教练：<strong>就是这个道理。</strong></p>
+<hr />
+<h2>④ 「那摘要长什么样？」</h2>
+<p>教练：压缩之后，抽屉里多了个东西——<code>self.state.summary</code>。</p>
+<p>打开看看：</p>
+<pre><code>&lt;system-info&gt;
+# Task Overview
+用户在学习 AgentScope 的 context 压缩机制
+
+# Current State
+已掌握：context 超 80% 触发压缩，旧对话被 LLM 浓缩成摘要
+
+# Important Discoveries
+1. 压缩不是裁剪，是用摘要替换旧对话
+2. 有 3 层兜底机制
+3. 边界消息按粒度拆分，保证 tool_call 和 result 成对
+
+# Next Steps
+可以继续探索 Offloader 或 ReAct 循环
+
+# Context to Preserve
+用户偏好师父带徒弟节奏，做笔记到 source-notes/
+&lt;/system-info&gt;
+</code></pre>
+<p>这个摘要按 <strong>5 个结构化字段</strong> 生成：<br />
+- <code>task_overview</code> — 用户在干嘛（300字）<br />
+- <code>current_state</code> — 干到哪了（300字）<br />
+- <code>important_discoveries</code> — 踩了啥坑、有啥发现（300字）<br />
+- <code>next_steps</code> — 接下来干啥（200字）<br />
+- <code>context_to_preserve</code> — 用户喜好、承诺（300字）</p>
+<p>以后 Agent 的系统提示里会带着这个 <code>&lt;system-info&gt;</code> 标签，等于它知道「前面聊过啥，但不用一字不差地记住每句话」。</p>
+<hr />
+<h2>⑤ 「那万一压不成功呢？」</h2>
+<p>徒弟：如果……压缩本身失败了怎么办？比如摘要太长塞不进去？</p>
+<p>教练：你问到关键点了。AgentScope 准备了<strong>三层兜底</strong>。</p>
+<h3>第一层：保留太多，压了个寂寞</h3>
+<pre><code class="language-python"># reserve_ratio 设得太高
+# 虽然超了 80%，但旧对话全在「保留区」里
+# → 自动把 reserve_ratio 降到 0
+</code></pre>
+<h3>第二层：摘要太长，塞不进窗口</h3>
+<pre><code class="language-python"># 估算摘要的 token 数
+# 如果放不下，从旧对话里一条一条扔
+# 直到能塞下为止
+for i in range(1, len(msgs_to_compress) + 1):
+    messages = msgs_system + msgs_to_compress[i:] + ...
+    if 估算token数 &lt; 窗口大小 * 0.8:
+        break  # 够了！
+</code></pre>
+<h3>第三层：Offloader — 硬盘备份</h3>
+<pre><code class="language-python"># 如果有配置 offloader
+# 压缩掉的原始对话会存到硬盘
+# 以后 Agent 可以按需回头查
+if self.offloader:
+    path = await self.offloader.offload_context(
+        session_id,
+        msgs=msgs_to_compress,
+    )
+</code></pre>
+<p>徒弟感叹：<strong>这三层兜底一看就是踩过坑的。</strong></p>
+<p>教练笑：开源项目嘛，都是被生产环境教育出来的。</p>
+<hr />
+<h2>⑥ 「那我怎么调这些参数？」</h2>
+<p>教练：<code>ContextConfig</code> 类暴露了所有旋钮：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>默认值</th>
+<th>意思</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>trigger_ratio</code></td>
+<td>0.8</td>
+<td>context 用到窗口的 80% 就触发压缩</td>
+</tr>
+<tr>
+<td><code>reserve_ratio</code></td>
+<td>0.1</td>
+<td>压缩后留 10% 给最近的消息</td>
+</tr>
+<tr>
+<td><code>tool_result_limit</code></td>
+<td>3000</td>
+<td>单个工具结果超过 3000 token 就截断</td>
+</tr>
+<tr>
+<td><code>compression_prompt</code></td>
+<td>见源码</td>
+<td>教大模型怎么写摘要的提示词</td>
+</tr>
+<tr>
+<td><code>summary_template</code></td>
+<td>见源码</td>
+<td>摘要怎么拼进系统提示里</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-python">from agentscope.agent import ContextConfig
+
+my_config = ContextConfig(
+    trigger_ratio=0.75,      # 75% 就压，早点清
+    reserve_ratio=0.15,      # 多留点最近的对话
+    tool_result_limit=2000,  # 工具结果超过 2000 token 就截断
+)
+
+agent = Agent(
+    name=&quot;我的助手&quot;,
+    model=model,
+    system_prompt=&quot;...&quot;,
+    context_config=my_config,  # 👈 传进去就行了
+)
+</code></pre>
+<p>徒弟：那如果模型窗口是 65536（deepseek-chat），80% 就是 52428 token 才触发压缩……实际上很少聊到这么多？</p>
+<p>教练：是的，大多数场景几十轮对话就触发了。但遇到<strong>工具调用特别多</strong>的场景，一步推理可能产生几万 token 的工具结果，这个机制就救命了。</p>
+<hr />
+<h2>⑦ 课后总结</h2>
+<p>徒弟整理笔记：</p>
+<table>
+<thead>
+<tr>
+<th>知识点</th>
+<th>一句话</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>不是删，是压缩</td>
+<td>旧对话 → LLM 写摘要 → 替换</td>
+</tr>
+<tr>
+<td>触发时机</td>
+<td>context 超窗口的 <strong>80%</strong></td>
+</tr>
+<tr>
+<td>保留策略</td>
+<td>最近的 <strong>10%</strong> 不动，只压前面的</td>
+</tr>
+<tr>
+<td>摘要格式</td>
+<td>5 个结构化字段</td>
+</tr>
+<tr>
+<td>三层兜底</td>
+<td>reserve 降级 / 逐条剔除 / offloader 落盘</td>
+</tr>
+<tr>
+<td>配置入口</td>
+<td><code>ContextConfig</code> — 创建 Agent 时传进去</td>
+</tr>
+</tbody>
+</table>
+<p>教练：<strong>完美。</strong></p>
+<blockquote>
+<p><strong>番外篇预告：Context 压缩机制</strong></p>
+<p>本文已经把压缩机制讲完了。但在实际源码中，<code>compress_context()</code> 是在 <code>_reply()</code> 里被调用的——它是 <strong>ReActAgent 推理循环中的一个环节</strong>。</p>
+<p>下节课我们回到主线，拆解 <strong>ReActAgent「想一下→动一下→再想一下」</strong> 的核心循环。<br />
+到时候你会看到：压缩是怎么插入在这个循环里的，以及它和工具调用、结果处理是怎么配合的。</p>
+</blockquote>
+<hr />
+<p><em>本系列用师徒对话拆解 AgentScope 源码原理，欢迎转发给同样好奇的朋友。</em><br />
+<em>关注「黑夜向日葵」，每周拆一个源码零件。</em></p>
+</body>
+</html>
